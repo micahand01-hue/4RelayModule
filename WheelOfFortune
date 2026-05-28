@@ -1,0 +1,154 @@
+// ============================================================
+// ESP32-S3 + GC9A01 Round Display + Rotary Encoder + 4 Relays
+// ============================================================
+
+#include <lvgl.h>
+#include <SPI.h>
+
+// ============================================================
+// DISPLAY PINS
+// ============================================================
+static const int TFT_SCK  = 12;
+static const int TFT_MOSI = 11;
+static const int TFT_MISO = -1;
+static const int TFT_CS   = 10;
+static const int TFT_DC   = 9;
+static const int TFT_RST  = 8;
+
+static const int16_t TFT_W = 240;
+static const int16_t TFT_H = 240;
+
+static const uint32_t TFT_SPI_HZ = 40000000;
+
+SPIClass tftSPI = SPI;
+
+// ============================================================
+// ENCODER PINS
+// ============================================================
+static const int PIN_ENC_CLK = 4;
+static const int PIN_ENC_DT  = 5;
+static const int PIN_ENC_SW  = 6;
+
+// ============================================================
+// RELAY PINS
+// ============================================================
+static const int RELAY1 = 13;
+static const int RELAY2 = 14;
+static const int RELAY3 = 15;
+static const int RELAY4 = 16;
+
+// ============================================================
+// LVGL BUFFERS & OBJECTS
+// ============================================================
+static uint8_t draw_buf[TFT_W * 40 * 2];
+
+static lv_obj_t *relayBoxes[4];
+static lv_obj_t *speedLabel;
+static lv_obj_t *statusLabel;
+
+// ============================================================
+// STATE VARIABLES
+// ============================================================
+static int activeRelay = 0;
+static float speed_mult = 1.0f;
+static uint32_t lastRelayChange = 0;
+
+static bool isPaused = false;       // True when the wheel has officially stopped
+static bool isSpinningDown = false; // True when the wheel is currently slowing down
+
+static int enc_last_clk = HIGH;
+static int enc_last_sw  = HIGH;
+static uint32_t enc_last_clk_ms = 0;
+static uint32_t enc_last_sw_ms  = 0;
+
+// ============================================================
+// SPI HELPERS
+// ============================================================
+static inline void csLow()  { digitalWrite(TFT_CS, LOW); }
+static inline void csHigh() { digitalWrite(TFT_CS, HIGH); }
+static inline void dcCmd()  { digitalWrite(TFT_DC, LOW); }
+static inline void dcData() { digitalWrite(TFT_DC, HIGH); }
+
+static void writeCmd(uint8_t cmd) {
+  dcCmd();
+  csLow();
+  tftSPI.transfer(cmd);
+  csHigh();
+}
+
+static void writeBytes(const uint8_t* data, size_t len) {
+  dcData();
+  csLow();
+  tftSPI.writeBytes(data, len);
+  csHigh();
+}
+
+static void writeCmdBytes(uint8_t cmd, const uint8_t* data, size_t len) {
+  writeCmd(cmd);
+  if (len) writeBytes(data, len);
+}
+
+// ============================================================
+// FULL DISPLAY INIT
+// ============================================================
+static void gc9a01Init() {
+  writeCmd(0xEF);
+  { uint8_t d[] = {0x14};                          writeCmdBytes(0xEB, d, 1); }
+  writeCmd(0xFE);
+  writeCmd(0xEF);
+  { uint8_t d[] = {0x14};                          writeCmdBytes(0xEB, d, 1); }
+  { uint8_t d[] = {0x40};                          writeCmdBytes(0x84, d, 1); }
+  { uint8_t d[] = {0xFF};                          writeCmdBytes(0x85, d, 1); }
+  { uint8_t d[] = {0xFF};                          writeCmdBytes(0x86, d, 1); }
+  { uint8_t d[] = {0xFF};                          writeCmdBytes(0x87, d, 1); }
+  { uint8_t d[] = {0x0A};                          writeCmdBytes(0x88, d, 1); }
+  { uint8_t d[] = {0x21};                          writeCmdBytes(0x89, d, 1); }
+  { uint8_t d[] = {0x00};                          writeCmdBytes(0x8A, d, 1); }
+  { uint8_t d[] = {0x80};                          writeCmdBytes(0x8B, d, 1); }
+  { uint8_t d[] = {0x01};                          writeCmdBytes(0x8C, d, 1); }
+  { uint8_t d[] = {0x01};                          writeCmdBytes(0x8D, d, 1); }
+  { uint8_t d[] = {0xFF};                          writeCmdBytes(0x8E, d, 1); }
+  { uint8_t d[] = {0xFF};                          writeCmdBytes(0x8F, d, 1); }
+  { uint8_t d[] = {0x00, 0x20};                    writeCmdBytes(0xB6, d, 2); }
+  
+  // Right-side up flip
+  { uint8_t d[] = {0xC0};                          writeCmdBytes(0x36, d, 1); }
+  
+  { uint8_t d[] = {0x05};                          writeCmdBytes(0x3A, d, 1); }
+  { uint8_t d[] = {0x08,0x08,0x08,0x08};           writeCmdBytes(0x90, d, 4); }
+  { uint8_t d[] = {0x06};                          writeCmdBytes(0xBD, d, 1); }
+  { uint8_t d[] = {0x00};                          writeCmdBytes(0xBC, d, 1); }
+  { uint8_t d[] = {0x60,0x01,0x04};                writeCmdBytes(0xFF, d, 3); }
+  { uint8_t d[] = {0x13};                          writeCmdBytes(0xC3, d, 1); }
+  { uint8_t d[] = {0x13};                          writeCmdBytes(0xC4, d, 1); }
+  { uint8_t d[] = {0x22};                          writeCmdBytes(0xC9, d, 1); }
+  { uint8_t d[] = {0x11};                          writeCmdBytes(0xBE, d, 1); }
+  { uint8_t d[] = {0x10,0x0E};                     writeCmdBytes(0xE1, d, 2); }
+  { uint8_t d[] = {0x21,0x0C,0x02};                writeCmdBytes(0xDF, d, 3); }
+  { uint8_t d[] = {0x45,0x09,0x08,0x08,0x26,0x2A}; writeCmdBytes(0xF0, d, 6); }
+  { uint8_t d[] = {0x43,0x70,0x72,0x36,0x37,0x6F}; writeCmdBytes(0xF1, d, 6); }
+  { uint8_t d[] = {0x45,0x09,0x08,0x08,0x26,0x2A}; writeCmdBytes(0xF2, d, 6); }
+  { uint8_t d[] = {0x43,0x70,0x72,0x36,0x37,0x6F}; writeCmdBytes(0xF3, d, 6); }
+  { uint8_t d[] = {0x1B,0x0B};                     writeCmdBytes(0xED, d, 2); }
+  { uint8_t d[] = {0x77};                          writeCmdBytes(0xAE, d, 1); }
+  { uint8_t d[] = {0x63};                          writeCmdBytes(0xCD, d, 1); }
+  { uint8_t d[] = {0x07,0x07,0x04,0x0E,0x0F,0x09,0x07,0x08,0x03}; writeCmdBytes(0x70, d, 9); }
+  { uint8_t d[] = {0x34};                          writeCmdBytes(0xE8, d, 1); }
+  { uint8_t d[] = {0x18,0x0D,0x71,0xED,0x70,0x70,0x18,0x0F,0x71,0xEF,0x70,0x70}; writeCmdBytes(0x62, d, 12); }
+  { uint8_t d[] = {0x18,0x11,0x71,0xF1,0x70,0x70,0x18,0x13,0x71,0xF3,0x70,0x70}; writeCmdBytes(0x63, d, 12); }
+  { uint8_t d[] = {0x28,0x29,0xF1,0x01,0xF1,0x00,0x07}; writeCmdBytes(0x64, d, 7); }
+  { uint8_t d[] = {0x3C,0x00,0xCD,0x67,0x45,0x45,0x10,0x00,0x00,0x00}; writeCmdBytes(0x66, d, 10); }
+  { uint8_t d[] = {0x00,0x3C,0x00,0x00,0x00,0x01,0x54,0x10,0x32,0x98}; writeCmdBytes(0x67, d, 10); }
+  { uint8_t d[] = {0x10,0x85,0x80,0x00,0x00,0x4E,0x00}; writeCmdBytes(0x74, d, 7); }
+  { uint8_t d[] = {0x3E,0x07};                     writeCmdBytes(0x98, d, 2); }
+  writeCmd(0x35);
+  writeCmd(0x21);
+  writeCmd(0x11);
+  delay(120);
+  writeCmd(0x29);
+  delay(20);
+}
+
+static void setAddrWindow(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
+  writeCmd(0x2A);
+  uint8
