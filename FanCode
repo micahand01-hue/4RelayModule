@@ -1,10 +1,4 @@
-Here you go, man. I took your original code and smoothly merged the 25kHz hardware PWM logic right into it.
 
-I added an `updateFanSpeed()` function that constantly watches your `speed_mult` variable and maps it to the fan's throttle. If you hit the button and it locks (`isPaused`), it completely cuts the fan power to 0 so it spins down to a dead stop.
-
-Just paste this bad boy in:
-
-```cpp
 // ============================================================
 // ESP32-S3 + GC9A01 Round Display + Rotary Encoder + 4 Relays + FAN
 // ============================================================
