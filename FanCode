@@ -1,0 +1,449 @@
+Here you go, man. I took your original code and smoothly merged the 25kHz hardware PWM logic right into it.
+
+I added an `updateFanSpeed()` function that constantly watches your `speed_mult` variable and maps it to the fan's throttle. If you hit the button and it locks (`isPaused`), it completely cuts the fan power to 0 so it spins down to a dead stop.
+
+Just paste this bad boy in:
+
+```cpp
+// ============================================================
+// ESP32-S3 + GC9A01 Round Display + Rotary Encoder + 4 Relays + FAN
+// ============================================================
+
+#include <lvgl.h>
+#include <SPI.h>
+
+// ============================================================
+// DISPLAY PINS
+// ============================================================
+static const int TFT_SCK  = 12;
+static const int TFT_MOSI = 11;
+static const int TFT_MISO = -1;
+static const int TFT_CS   = 10;
+static const int TFT_DC   = 9;
+static const int TFT_RST  = 8;
+
+static const int16_t TFT_W = 240;
+static const int16_t TFT_H = 240;
+
+static const uint32_t TFT_SPI_HZ = 40000000;
+
+SPIClass tftSPI = SPI;
+
+// ============================================================
+// ENCODER PINS
+// ============================================================
+static const int PIN_ENC_CLK = 4;
+static const int PIN_ENC_DT  = 5;
+static const int PIN_ENC_SW  = 6;
+
+// ============================================================
+// RELAY & FAN PINS
+// ============================================================
+static const int RELAY1 = 13;
+static const int RELAY2 = 14;
+static const int RELAY3 = 15;
+static const int RELAY4 = 16;
+
+static const int PIN_FAN_PWM = 17; // The Blue wire goes here
+
+// ============================================================
+// LVGL BUFFERS & OBJECTS
+// ============================================================
+static uint8_t draw_buf[TFT_W * 40 * 2];
+
+static lv_obj_t *relayBoxes[4];
+static lv_obj_t *speedLabel;
+static lv_obj_t *statusLabel;
+
+// ============================================================
+// STATE VARIABLES
+// ============================================================
+static int activeRelay = 0;
+static float speed_mult = 1.0f;
+static uint32_t lastRelayChange = 0;
+
+static bool isPaused = false;       // True when the wheel has officially stopped
+static bool isSpinningDown = false; // True when the wheel is currently slowing down
+
+static int enc_last_clk = HIGH;
+static int enc_last_sw  = HIGH;
+static uint32_t enc_last_clk_ms = 0;
+static uint32_t enc_last_sw_ms  = 0;
+
+// ============================================================
+// SPI HELPERS
+// ============================================================
+static inline void csLow()  { digitalWrite(TFT_CS, LOW); }
+static inline void csHigh() { digitalWrite(TFT_CS, HIGH); }
+static inline void dcCmd()  { digitalWrite(TFT_DC, LOW); }
+static inline void dcData() { digitalWrite(TFT_DC, HIGH); }
+
+static void writeCmd(uint8_t cmd) {
+  dcCmd();
+  csLow();
+  tftSPI.transfer(cmd);
+  csHigh();
+}
+
+static void writeBytes(const uint8_t* data, size_t len) {
+  dcData();
+  csLow();
+  tftSPI.writeBytes(data, len);
+  csHigh();
+}
+
+static void writeCmdBytes(uint8_t cmd, const uint8_t* data, size_t len) {
+  writeCmd(cmd);
+  if (len) writeBytes(data, len);
+}
+
+// ============================================================
+// FULL DISPLAY INIT
+// ============================================================
+static void gc9a01Init() {
+  writeCmd(0xEF);
+  { uint8_t d[] = {0x14};                          writeCmdBytes(0xEB, d, 1); }
+  writeCmd(0xFE);
+  writeCmd(0xEF);
+  { uint8_t d[] = {0x14};                          writeCmdBytes(0xEB, d, 1); }
+  { uint8_t d[] = {0x40};                          writeCmdBytes(0x84, d, 1); }
+  { uint8_t d[] = {0xFF};                          writeCmdBytes(0x85, d, 1); }
+  { uint8_t d[] = {0xFF};                          writeCmdBytes(0x86, d, 1); }
+  { uint8_t d[] = {0xFF};                          writeCmdBytes(0x87, d, 1); }
+  { uint8_t d[] = {0x0A};                          writeCmdBytes(0x88, d, 1); }
+  { uint8_t d[] = {0x21};                          writeCmdBytes(0x89, d, 1); }
+  { uint8_t d[] = {0x00};                          writeCmdBytes(0x8A, d, 1); }
+  { uint8_t d[] = {0x80};                          writeCmdBytes(0x8B, d, 1); }
+  { uint8_t d[] = {0x01};                          writeCmdBytes(0x8C, d, 1); }
+  { uint8_t d[] = {0x01};                          writeCmdBytes(0x8D, d, 1); }
+  { uint8_t d[] = {0xFF};                          writeCmdBytes(0x8E, d, 1); }
+  { uint8_t d[] = {0xFF};                          writeCmdBytes(0x8F, d, 1); }
+  { uint8_t d[] = {0x00, 0x20};                    writeCmdBytes(0xB6, d, 2); }
+  
+  // Right-side up flip
+  { uint8_t d[] = {0xC0};                          writeCmdBytes(0x36, d, 1); }
+  
+  { uint8_t d[] = {0x05};                          writeCmdBytes(0x3A, d, 1); }
+  { uint8_t d[] = {0x08,0x08,0x08,0x08};           writeCmdBytes(0x90, d, 4); }
+  { uint8_t d[] = {0x06};                          writeCmdBytes(0xBD, d, 1); }
+  { uint8_t d[] = {0x00};                          writeCmdBytes(0xBC, d, 1); }
+  { uint8_t d[] = {0x60,0x01,0x04};                writeCmdBytes(0xFF, d, 3); }
+  { uint8_t d[] = {0x13};                          writeCmdBytes(0xC3, d, 1); }
+  { uint8_t d[] = {0x13};                          writeCmdBytes(0xC4, d, 1); }
+  { uint8_t d[] = {0x22};                          writeCmdBytes(0xC9, d, 1); }
+  { uint8_t d[] = {0x11};                          writeCmdBytes(0xBE, d, 1); }
+  { uint8_t d[] = {0x10,0x0E};                     writeCmdBytes(0xE1, d, 2); }
+  { uint8_t d[] = {0x21,0x0C,0x02};                writeCmdBytes(0xDF, d, 3); }
+  { uint8_t d[] = {0x45,0x09,0x08,0x08,0x26,0x2A}; writeCmdBytes(0xF0, d, 6); }
+  { uint8_t d[] = {0x43,0x70,0x72,0x36,0x37,0x6F}; writeCmdBytes(0xF1, d, 6); }
+  { uint8_t d[] = {0x45,0x09,0x08,0x08,0x26,0x2A}; writeCmdBytes(0xF2, d, 6); }
+  { uint8_t d[] = {0x43,0x70,0x72,0x36,0x37,0x6F}; writeCmdBytes(0xF3, d, 6); }
+  { uint8_t d[] = {0x1B,0x0B};                     writeCmdBytes(0xED, d, 2); }
+  { uint8_t d[] = {0x77};                          writeCmdBytes(0xAE, d, 1); }
+  { uint8_t d[] = {0x63};                          writeCmdBytes(0xCD, d, 1); }
+  { uint8_t d[] = {0x07,0x07,0x04,0x0E,0x0F,0x09,0x07,0x08,0x03}; writeCmdBytes(0x70, d, 9); }
+  { uint8_t d[] = {0x34};                          writeCmdBytes(0xE8, d, 1); }
+  { uint8_t d[] = {0x18,0x0D,0x71,0xED,0x70,0x70,0x18,0x0F,0x71,0xEF,0x70,0x70}; writeCmdBytes(0x62, d, 12); }
+  { uint8_t d[] = {0x18,0x11,0x71,0xF1,0x70,0x70,0x18,0x13,0x71,0xF3,0x70,0x70}; writeCmdBytes(0x63, d, 12); }
+  { uint8_t d[] = {0x28,0x29,0xF1,0x01,0xF1,0x00,0x07}; writeCmdBytes(0x64, d, 7); }
+  { uint8_t d[] = {0x3C,0x00,0xCD,0x67,0x45,0x45,0x10,0x00,0x00,0x00}; writeCmdBytes(0x66, d, 10); }
+  { uint8_t d[] = {0x00,0x3C,0x00,0x00,0x00,0x01,0x54,0x10,0x32,0x98}; writeCmdBytes(0x67, d, 10); }
+  { uint8_t d[] = {0x10,0x85,0x80,0x00,0x00,0x4E,0x00}; writeCmdBytes(0x74, d, 7); }
+  { uint8_t d[] = {0x3E,0x07};                     writeCmdBytes(0x98, d, 2); }
+  writeCmd(0x35);
+  writeCmd(0x21);
+  writeCmd(0x11);
+  delay(120);
+  writeCmd(0x29);
+  delay(20);
+}
+
+static void setAddrWindow(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
+  writeCmd(0x2A);
+  uint8_t data_col[] = { (uint8_t)(x0 >> 8), (uint8_t)x0, (uint8_t)(x1 >> 8), (uint8_t)x1 };
+  writeBytes(data_col, 4);
+  writeCmd(0x2B);
+  uint8_t data_row[] = { (uint8_t)(y0 >> 8), (uint8_t)y0, (uint8_t)(y1 >> 8), (uint8_t)y1 };
+  writeBytes(data_row, 4);
+  writeCmd(0x2C);
+}
+
+// ============================================================
+// LVGL FLUSH 
+// ============================================================
+static inline void swapRgb565InPlace(uint8_t* buf, uint32_t pixels) {
+  for (uint32_t i = 0; i < pixels; i++) {
+    uint8_t t = buf[2 * i];
+    buf[2 * i] = buf[2 * i + 1];
+    buf[2 * i + 1] = t;
+  }
+}
+
+static void disp_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
+  uint32_t w = area->x2 - area->x1 + 1;
+  uint32_t h = area->y2 - area->y1 + 1;
+  uint32_t pixels = w * h;
+
+  swapRgb565InPlace(px_map, pixels);
+  setAddrWindow(area->x1, area->y1, area->x2, area->y2);
+
+  dcData();
+  csLow();
+  tftSPI.writeBytes(px_map, pixels * 2);
+  csHigh();
+
+  lv_display_flush_ready(disp);
+}
+
+static uint32_t lv_tick_cb(void) {
+  return millis();
+}
+
+// ============================================================
+// UI
+// ============================================================
+static void updateRelayDisplay() {
+  for (int i = 0; i < 4; i++) {
+    if ((i + 1) == activeRelay) {
+      lv_obj_set_style_bg_color(relayBoxes[i], lv_color_hex(0x00FF00), 0);
+    } else {
+      lv_obj_set_style_bg_color(relayBoxes[i], lv_color_hex(0x303030), 0);
+    }
+  }
+
+  char buf[64];
+  sprintf(buf, "Speed %.1fx", speed_mult);
+  lv_label_set_text(speedLabel, buf);
+
+  // Update center text based on wheel state
+  if (isSpinningDown) {
+    lv_label_set_text(statusLabel, "SLOWING...");
+    lv_obj_set_style_text_color(statusLabel, lv_color_hex(0xFFFF00), 0); // Yellow
+  } else if (isPaused) {
+    lv_label_set_text(statusLabel, "LOCKED");
+    lv_obj_set_style_text_color(statusLabel, lv_color_hex(0xFF0000), 0); // Red
+  } else {
+    lv_label_set_text(statusLabel, ""); // Clear it when running normally
+  }
+}
+
+static void buildUI() {
+  lv_obj_t *scr = lv_screen_active();
+  lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+
+  // Speed Label
+  speedLabel = lv_label_create(scr);
+  lv_obj_set_style_text_color(speedLabel, lv_color_hex(0xFFFFFF), 0);
+  lv_label_set_text(speedLabel, "Speed 1.0x");
+  lv_obj_align(speedLabel, LV_ALIGN_TOP_MID, 0, 15);
+
+  // Status Label (Center)
+  statusLabel = lv_label_create(scr);
+  lv_obj_set_style_text_color(statusLabel, lv_color_hex(0xFF0000), 0); 
+  lv_obj_align(statusLabel, LV_ALIGN_CENTER, 0, 0);
+  lv_label_set_text(statusLabel, "");
+
+  // Relay Boxes
+  for (int i = 0; i < 4; i++) {
+    relayBoxes[i] = lv_obj_create(scr);
+    lv_obj_set_size(relayBoxes[i], 70, 70);
+    lv_obj_set_style_radius(relayBoxes[i], 15, 0);
+    lv_obj_set_style_bg_color(relayBoxes[i], lv_color_hex(0x303030), 0);
+    lv_obj_set_style_border_width(relayBoxes[i], 0, 0);
+
+    int angle = i * 90;
+    int x = 120 + cos(angle * 3.14159 / 180.0) * 70 - 35;
+    int y = 120 + sin(angle * 3.14159 / 180.0) * 70 - 35;
+    
+    lv_obj_set_pos(relayBoxes[i], x, y);
+
+    lv_obj_t *label = lv_label_create(relayBoxes[i]);
+    char txt[10];
+    sprintf(txt, "%d", i + 1);
+    lv_label_set_text(label, txt);
+    lv_obj_center(label);
+  }
+}
+
+// ============================================================
+// RELAYS & FAN CONTROL
+// ============================================================
+static void setAllRelaysOff() {
+  digitalWrite(RELAY1, HIGH);
+  digitalWrite(RELAY2, HIGH);
+  digitalWrite(RELAY3, HIGH);
+  digitalWrite(RELAY4, HIGH);
+}
+
+static void updateFanSpeed() {
+  // Map speed_mult (0.2 to 10.0) to PWM range (0 to 255)
+  int fan_pwm_value = map(speed_mult * 10, 2, 100, 0, 255);
+  
+  // Cut the engine if we are fully locked out
+  if (isPaused) {
+    fan_pwm_value = 0;
+  }
+
+  // Constrain just to be super safe before writing to hardware
+  if(fan_pwm_value < 0) fan_pwm_value = 0;
+  if(fan_pwm_value > 255) fan_pwm_value = 255;
+
+  ledcWrite(0, fan_pwm_value);
+}
+
+static void updateRelays() {
+  if (isPaused) return; // Completely frozen!
+
+  uint32_t interval = (uint32_t)(500 / speed_mult);
+  if (interval < 50) interval = 50;
+
+  if (millis() - lastRelayChange >= interval) {
+    lastRelayChange = millis();
+    setAllRelaysOff();
+
+    activeRelay++;
+    if (activeRelay > 4) activeRelay = 1;
+
+    switch(activeRelay) {
+      case 1: digitalWrite(RELAY1, LOW); break;
+      case 2: digitalWrite(RELAY2, LOW); break;
+      case 3: digitalWrite(RELAY3, LOW); break;
+      case 4: digitalWrite(RELAY4, LOW); break;
+    }
+
+    // --- WHEEL OF FORTUNE SPIN DOWN LOGIC ---
+    if (isSpinningDown) {
+      // Drop the speed multiplier by 40% every single "click" to brake much harder
+      speed_mult *= 0.60f; 
+
+      // Lock it in much sooner so you aren't waiting forever for the final tick
+      if (speed_mult < 0.25f) { // Locks in when the gap hits ~2 seconds instead of 4+
+        isSpinningDown = false;
+        isPaused = true;
+      }
+    }
+
+    updateRelayDisplay();
+    Serial.printf("Relay %d active | Speed %.2fx\n", activeRelay, speed_mult);
+  }
+}
+
+// ============================================================
+// ENCODER
+// ============================================================
+static void poll_encoder() {
+  uint32_t now = millis();
+  int clk = digitalRead(PIN_ENC_CLK);
+
+  // Check turning (Only allow if we are NOT spinning down and NOT paused)
+  if (!isSpinningDown && !isPaused) {
+    if (clk != enc_last_clk && (now - enc_last_clk_ms) > 2) {
+      if (enc_last_clk == HIGH && clk == LOW) {
+        int dt = digitalRead(PIN_ENC_DT);
+        if (dt == HIGH) speed_mult *= 1.15f;
+        else speed_mult /= 1.15f;
+
+        if (speed_mult < 0.2f) speed_mult = 0.2f;
+        if (speed_mult > 10.0f) speed_mult = 10.0f;
+
+        updateRelayDisplay();
+      }
+      enc_last_clk_ms = now;
+      enc_last_clk = clk;
+    }
+  } else {
+    // Keep tracking state even if locked out so it doesn't jump later
+    enc_last_clk_ms = now;
+    enc_last_clk = clk; 
+  }
+
+  // Check pushing (Start Spin Down OR Resume normal)
+  int sw = digitalRead(PIN_ENC_SW);
+  if (sw != enc_last_sw && (now - enc_last_sw_ms) > 20) {
+    if (enc_last_sw == HIGH && sw == LOW) {
+      
+      if (isPaused) {
+        // We were locked in. Hitting it again starts a fresh run!
+        isPaused = false;
+        speed_mult = 1.0f; // Reset to default fast speed
+        lastRelayChange = millis();
+      } else if (!isSpinningDown) {
+        // We are currently running. Hit the button to trigger the spin-down!
+        isSpinningDown = true;
+      }
+      
+      updateRelayDisplay();
+    }
+    enc_last_sw_ms = now;
+    enc_last_sw = sw;
+  }
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TFT_CS, OUTPUT);
+  pinMode(TFT_DC, OUTPUT);
+  pinMode(TFT_RST, OUTPUT);
+
+  digitalWrite(TFT_CS, HIGH);
+
+  tftSPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI, TFT_CS);
+  tftSPI.beginTransaction(SPISettings(TFT_SPI_HZ, MSBFIRST, SPI_MODE0));
+
+  digitalWrite(TFT_RST, LOW);
+  delay(20);
+  digitalWrite(TFT_RST, HIGH);
+  delay(120);
+
+  gc9a01Init();
+
+  pinMode(PIN_ENC_CLK, INPUT_PULLUP);
+  pinMode(PIN_ENC_DT,  INPUT_PULLUP);
+  pinMode(PIN_ENC_SW,  INPUT_PULLUP);
+
+  pinMode(RELAY1, OUTPUT);
+  pinMode(RELAY2, OUTPUT);
+  pinMode(RELAY3, OUTPUT);
+  pinMode(RELAY4, OUTPUT);
+  setAllRelaysOff();
+
+  // --- FAN PWM SETUP ---
+  // Channel 0, 25kHz frequency, 8-bit resolution
+  ledcSetup(0, 25000, 8); 
+  ledcAttachPin(PIN_FAN_PWM, 0);
+  ledcWrite(0, 0); // Start off completely quiet
+
+  lv_init();
+  lv_tick_set_cb(lv_tick_cb);
+
+  lv_display_t *disp = lv_display_create(TFT_W, TFT_H);
+  lv_display_set_flush_cb(disp, disp_flush_cb);
+  lv_display_set_buffers(disp, draw_buf, NULL, sizeof(draw_buf), LV_DISPLAY_RENDER_MODE_PARTIAL);
+
+  buildUI();
+  updateRelayDisplay();
+
+  Serial.println("READY");
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+void loop() {
+  poll_encoder();
+  updateRelays();
+  
+  // Continuously push the current speed state to the fan
+  updateFanSpeed();
+
+  uint32_t t = lv_timer_handler();
+  if (t == LV_NO_TIMER_READY) t = 5;
+  delay(t);
+}
+
+```
